@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fakescan"]
+members = ["crates/fakescan", "crates/fakescan-mcp"]
 
 [workspace.package]
 version = "0.1.0"

@@ -19,6 +19,7 @@ Root [README](../README.md) is the quick start.
 | [roadmap.md](roadmap.md) | Full idea catalog (shipped / next / later) |
 | [test-matrix.md](test-matrix.md) | pdfcraft behaviors vs fakescan knobs |
 | [architecture.md](architecture.md) | Components + control API |
+| [proposals/mcp.md](proposals/mcp.md) | Optional MCP server over `/v1` (attach-only, confirm gate) |
 | [specs/](specs/README.md) | Stack notes — DPWS, Discovery, Transfer, Eventing, Windows client (narrative; prefer `reference/` for schema rules) |
 | [e2e-wia-status.md](e2e-wia-status.md) | Dated **lab log** (checklist: runbook; scripts: windows.md) |
 | [prior-art.md](prior-art.md) | Why this repo exists vs WIA samples / WsdScanService |

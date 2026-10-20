@@ -248,6 +248,11 @@ The MCP server **never starts or stops fakescan**.  It fails fast (error tool
 result) if the device is not reachable.  Available tools: `ctl_info`, `status`,
 `reset`, `pages`, `pattern`, `scenario`, `fault`, `ctl`.
 
+The package above is the external Python server and is not in this tree. The
+in-repo server is the optional `fakescan-mcp` crate (`docs/proposals/mcp.md`):
+stdio JSON-RPC, `send_*` confirm-gated, `write_*` refuses to
+overwrite, everything else read-only.
+
 ## Running multiple instances
 
 fakescan supports parallel named instances **within the same role**:

@@ -1,0 +1,19 @@
+[package]
+name = "fakescan-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Optional MCP server that drives a running fakescan over its /v1 control API"
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "fakescan-mcp"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"

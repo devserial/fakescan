@@ -38,10 +38,14 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy -p fakescan --all-targets -- -D warnings
+        run: |
+          cargo clippy -p fakescan --all-targets -- -D warnings
+          cargo clippy -p fakescan-mcp --all-targets -- -D warnings
 
       - name: test
-        run: cargo test -p fakescan
+        run: |
+          cargo test -p fakescan
+          cargo test -p fakescan-mcp
 
   docker:
     name: docker

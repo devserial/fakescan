@@ -491,10 +491,32 @@ struct AddDeviceBody {
     initial_pages: Option<u32>,
 }
 
+fn loopback_denied(
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    what: &str,
+) -> Option<axum::response::Response> {
+    let ip = peer.map(|Extension(ConnectInfo(addr))| addr.ip());
+    if ip.is_some_and(crate::ui::is_loopback_peer) {
+        None
+    } else {
+        Some(
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": format!("{what}: loopback peers only") })),
+            )
+                .into_response(),
+        )
+    }
+}
+
 async fn add_device(
     State(manager): State<Arc<DeviceManager>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Json(body): Json<AddDeviceBody>,
 ) -> axum::response::Response {
+    if let Some(resp) = loopback_denied(peer, "add device") {
+        return resp;
+    }
     // No explicit UUID: reuse the one the registry already holds for this id (Windows knows it).
     let uuid = body.device_uuid.or_else(|| manager.stored_uuid(&body.id));
     let mut dc = match uuid {
@@ -525,9 +547,13 @@ struct RemoveQuery {
 
 async fn remove_device(
     State(manager): State<Arc<DeviceManager>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(q): Query<RemoveQuery>,
 ) -> axum::response::Response {
+    if let Some(resp) = loopback_denied(peer, "remove device") {
+        return resp;
+    }
     match manager.remove_row(&id, q.forget.unwrap_or(false)).await {
         Ok(()) => Json(serde_json::json!({ "removed": id })).into_response(),
         Err(_) => not_found("unknown device"),
@@ -573,9 +599,13 @@ struct InstalledBody {
 
 async fn installed_device(
     State(manager): State<Arc<DeviceManager>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<InstalledBody>,
 ) -> axum::response::Response {
+    if let Some(resp) = loopback_denied(peer, "installed") {
+        return resp;
+    }
     if manager.get(&id).await.is_none() {
         return not_found("unknown device");
     }
@@ -592,8 +622,12 @@ async fn installed_device(
 
 async fn forget_device(
     State(manager): State<Arc<DeviceManager>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> axum::response::Response {
+    if let Some(resp) = loopback_denied(peer, "forget") {
+        return resp;
+    }
     if manager.get(&id).await.is_none() {
         return not_found("unknown device");
     }
@@ -613,7 +647,13 @@ async fn device_json(manager: &DeviceManager, id: &str) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
-async fn get_registry(State(manager): State<Arc<DeviceManager>>) -> axum::response::Response {
+async fn get_registry(
+    State(manager): State<Arc<DeviceManager>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+) -> axum::response::Response {
+    if let Some(resp) = loopback_denied(peer, "registry") {
+        return resp;
+    }
     match manager.registry_doc() {
         Ok(r) => Json(r).into_response(),
         Err(e) => (
@@ -632,8 +672,12 @@ struct ReconcileBody {
 
 async fn reconcile(
     State(manager): State<Arc<DeviceManager>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Json(body): Json<ReconcileBody>,
 ) -> axum::response::Response {
+    if let Some(resp) = loopback_denied(peer, "reconcile") {
+        return resp;
+    }
     match manager.reconcile_with_windows(&body.scanners) {
         Ok(r) => Json(r).into_response(),
         Err(e) => bad_request(e.to_string()),
@@ -779,10 +823,12 @@ async fn set_pages(
 async fn set_slow(
     State(world): State<Arc<RwLock<World>>>,
     Json(body): Json<SlowBody>,
-) -> Json<Status> {
+) -> Result<Json<Status>, (axum::http::StatusCode, String)> {
+    crate::state::check_slow(&body)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
     let mut w = world.write().await;
     w.apply_slow(&body);
-    Json(w.status())
+    Ok(Json(w.status()))
 }
 
 async fn set_pattern(
@@ -834,14 +880,16 @@ async fn set_scenario(
 async fn set_fault(
     State(world): State<Arc<RwLock<World>>>,
     Json(body): Json<FaultBody>,
-) -> Json<Status> {
+) -> Result<Json<Status>, (axum::http::StatusCode, String)> {
+    crate::state::check_fault_delays(&body)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
     let mut w = world.write().await;
     let changes = w.apply_faults(&body);
     wsd::job_events::maybe_emit_condition_changes(&w, wsd::soap::SCAN_NS_AIRSCAN, &changes);
     if !changes.is_empty() {
         wsd::job_events::maybe_emit_status_summary(&w, wsd::soap::SCAN_NS_AIRSCAN);
     }
-    Json(w.status())
+    Ok(Json(w.status()))
 }
 
 async fn get_loopback(State(world): State<Arc<RwLock<World>>>) -> Json<LoopbackStatus> {

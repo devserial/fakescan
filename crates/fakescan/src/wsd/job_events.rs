@@ -246,17 +246,23 @@ fn maybe_emit(world: &World, scan_ns: &str, short_action: &str, body_inner: &str
     let Some(notify_to) = world.event_notify_to().map(str::to_owned) else {
         return;
     };
+    let subscriber = world.notify_peer();
+    let Ok(target) = notify::accept_notify_target(&notify_to, subscriber) else {
+        warn!(%notify_to, "job event NotifyTo refused");
+        return;
+    };
     let service_ep = world.service_endpoint().to_string();
     let scan_ns = scan_ns.to_string();
     let action_short = short_action.to_string();
     let body_inner = body_inner.to_string();
+    let to = target.url();
     tokio::spawn(async move {
         let action = soap::scan_action(&scan_ns, &action_short);
-        let envelope = event_envelope(&scan_ns, &action, &notify_to, &service_ep, &body_inner);
-        match notify::post_soap_event(&notify_to, &action_short, &envelope).await {
-            Ok(()) => info!(%notify_to, action = %action_short, "job event notification sent"),
+        let envelope = event_envelope(&scan_ns, &action, &to, &service_ep, &body_inner);
+        match notify::post_soap_event(&target, &action_short, &envelope).await {
+            Ok(()) => info!(notify_to = %to, action = %action_short, "job event notification sent"),
             Err(e) => {
-                warn!(%notify_to, action = %action_short, error = %e, "job event notify failed")
+                warn!(notify_to = %to, action = %action_short, error = %e, "job event notify failed")
             }
         }
     });

@@ -1205,7 +1205,13 @@ fn encode_jpeg_ex(
             // One component: MCU = one 8x8 block, so a restart row is width/8 MCUs.
             encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
             encoder.set_restart_interval((w.div_ceil(8)).clamp(1, u16::MAX as u32) as u16);
-            let luma: Vec<u8> = img.as_raw().chunks_exact(3).map(|p| p[0]).collect();
+            let luma: Vec<u8> = img
+                .as_raw()
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| p[0])
+                .collect();
             encoder
                 .encode(&luma, w as u16, h as u16, jpeg_encoder::ColorType::Luma)
                 .map_err(|e| anyhow::anyhow!("jpeg encode: {e}"))?;
@@ -1975,7 +1981,13 @@ fn encode_jpeg2k(img: &RgbImage, gray: bool) -> Result<Vec<u8>> {
     use openjp2::{ColorSpace, EncodeOptions, Encoder, Format, Image};
 
     let image = if gray {
-        let luma: Vec<u8> = img.as_raw().chunks_exact(3).map(|p| p[0]).collect();
+        let luma: Vec<u8> = img
+            .as_raw()
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| p[0])
+            .collect();
         Image::from_interleaved_u8(img.width(), img.height(), ColorSpace::Greyscale, 1, &luma)
     } else {
         Image::from_interleaved_u8(img.width(), img.height(), ColorSpace::Srgb, 3, img.as_raw())
@@ -5877,7 +5889,7 @@ mod container_tests {
             }
             [s[0] / n, s[1] / n, s[2] / n]
         };
-        let got = mean(&mut raw.chunks_exact(3).map(ycc));
+        let got = mean(&mut raw.as_chunks::<3>().0.iter().map(|p| ycc(p)));
         let exp = mean(&mut want.pixels().map(|p| p.0));
         for c in 0..3 {
             assert!(

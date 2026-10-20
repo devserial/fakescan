@@ -158,9 +158,35 @@ impl FeederCaps {
     }
 }
 
+/// A profile id is one file name under the profiles directory: `[A-Za-z0-9_-]`, at most 64
+/// characters. Slashes, `..` and other path syntax are rejected so `POST /v1/profile` cannot
+/// read outside that directory.
+pub fn valid_profile_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 impl Profile {
     pub fn load(dir: &Path, id: &str) -> Result<Self> {
+        if !valid_profile_id(id) {
+            bail!("invalid profile id {id:?} (use [A-Za-z0-9_-], one file name)");
+        }
         let path = dir.join(format!("{id}.json"));
+        // `valid_profile_id` already forbids separators. This catches a symlink planted in the
+        // profiles directory that points outside it.
+        if path.is_file() {
+            if let (Ok(root), Ok(canon)) = (dir.canonicalize(), path.canonicalize()) {
+                if !canon.starts_with(&root) {
+                    bail!(
+                        "profile {id:?} resolves outside the profiles directory {}",
+                        dir.display()
+                    );
+                }
+            }
+        }
         if !path.is_file() {
             bail!("profile not found: {}", path.display());
         }
@@ -259,5 +285,26 @@ mod tray_tests {
             assert!(err.contains(needle), "{name}: {err}");
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn profile_id_cannot_escape_the_directory() {
+        let dir = dir();
+        for id in [
+            "../brother-wsd",
+            "..",
+            "brother-wsd/../../etc/passwd",
+            "a/b",
+            r"a\b",
+            "",
+        ] {
+            let err = Profile::load(&dir, id).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid profile id"),
+                "{id:?} should be rejected before any read: {err}"
+            );
+        }
+        assert!(valid_profile_id("brother-wsd"));
+        assert!(valid_profile_id("feeder-a4only"));
     }
 }

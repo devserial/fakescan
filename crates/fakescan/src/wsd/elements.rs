@@ -666,6 +666,7 @@ fn scanner_description(profile: &Profile) -> Element {
 /// Order: [`scanner_description`], full [`scanner_configuration`], then
 /// [`default_scan_ticket`] — same shapes as GetScannerElements — so a NotifyTo
 /// subscriber sees the advertised identity and capability set without re-polling.
+#[allow(dead_code)] // for the NotifyTo ScannerElementsChangeEvent body; not sent yet
 pub(crate) fn element_changes_xml(profile: &Profile) -> String {
     element_changes_elements(profile)
         .into_iter()

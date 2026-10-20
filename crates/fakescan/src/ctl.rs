@@ -20,6 +20,26 @@ use crate::manager::DeviceCtx;
 use crate::registry::WiaInfo;
 use crate::state::{FaultBody, LoopbackBody, PagesBody, World};
 
+/// Commands that shut the process down, write the registry, or change install state.
+///
+/// The control API shares the scan-service port, which listens on every interface by default.
+/// These commands are accepted from a loopback HTTP peer only. The named pipe calls
+/// [`dispatch`] directly and stays a local surface. Scan knobs (`pages`, `fault`, …) stay
+/// reachable from the LAN so a lab client can arm a device it did not start.
+const LOOPBACK_CMDS: &[&str] = &[
+    "shutdown",
+    "save",
+    "installed",
+    "mark_added",
+    "forget",
+    "reconcile",
+];
+
+/// True when `cmd` must come from a loopback HTTP peer.
+pub fn host_cmd_is_loopback_only(cmd: &str) -> bool {
+    LOOPBACK_CMDS.contains(&cmd)
+}
+
 /// Every cmd accepted by `POST /v1/ctl`.
 pub const CTL_CMDS: &[&str] = &[
     "status",
@@ -90,6 +110,17 @@ pub async fn post_ctl(
     let ctx = ctx.map(|axum::Extension(c)| c);
     let req: CtlRequest = serde_json::from_value(raw.clone())
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    if host_cmd_is_loopback_only(&req.cmd) {
+        let ip = peer
+            .as_ref()
+            .map(|axum::Extension(axum::extract::ConnectInfo(a))| a.ip());
+        if !ip.is_some_and(crate::ui::is_loopback_peer) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("{}: loopback peers only", req.cmd),
+            ));
+        }
+    }
     if req.cmd == "open_settings" {
         // `page` may sit at the top level (`{cmd, page}`) or in `args`.
         let args = match raw.get("page") {
@@ -303,7 +334,16 @@ pub async fn dispatch_ctx(
         }
 
         "fault" => {
-            let body: FaultBody = serde_json::from_value(req.args).unwrap_or_default();
+            // A missing `args` is an empty object (no flags change). A present but unusable
+            // value is an error — `unwrap_or_default` used to report success and change nothing.
+            let args = if req.args.is_null() {
+                serde_json::json!({})
+            } else {
+                req.args
+            };
+            let body: FaultBody =
+                serde_json::from_value(args).map_err(|e| anyhow::anyhow!("fault: {e}"))?;
+            crate::state::check_fault_delays(&body)?;
             let mut w = world.write().await;
             let changes = w.apply_faults(&body);
             // Best-effort NotifyTo for raised/cleared ScannerStatusCondition*.
@@ -359,6 +399,7 @@ pub async fn dispatch_ctx(
             if req.args.get("ms").is_none() && req.args.get("bps").is_none() {
                 anyhow::bail!("slow: need args.ms and/or args.bps");
             }
+            crate::state::check_slow(&body)?;
             let mut w = world.write().await;
             w.apply_slow(&body);
             Ok(serde_json::to_value(w.status())?)
@@ -388,8 +429,10 @@ pub async fn dispatch_ctx(
                 w.mint_push_scan(token.as_deref())?
             };
             if let Some(ref url) = pending.notify_to {
+                let subscriber = world.read().await.notify_peer();
                 let _ = crate::wsd::notify::deliver_scan_available(
                     url,
+                    subscriber,
                     crate::wsd::notify::SCAN_AVAILABLE_NS,
                     &pending.scan_identifier,
                     &pending.client_context,
@@ -912,5 +955,47 @@ mod tests {
             err.to_string().contains("lab-name"),
             "expected lab-name error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn ctl_fault_rejects_a_mistyped_flag() {
+        let w = test_world();
+        let err = dispatch(
+            &w,
+            CtlRequest {
+                cmd: "fault".into(),
+                args: json!({ "jam": "yes" }),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("fault:"), "{err}");
+        assert!(!w.read().await.status().jam);
+        // No args is still a no-op success.
+        dispatch(
+            &w,
+            CtlRequest {
+                cmd: "fault".into(),
+                args: Value::Null,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ctl_slow_rejects_an_unbounded_delay() {
+        let w = test_world();
+        let err = dispatch(
+            &w,
+            CtlRequest {
+                cmd: "slow".into(),
+                args: json!({ "ms": crate::state::MAX_CONTROL_DELAY_MS + 1 }),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert_eq!(w.read().await.slow_retrieve_ms(), 0);
     }
 }

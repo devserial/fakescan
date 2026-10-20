@@ -28,7 +28,11 @@ async fn send(
         .uri(uri)
         .header(
             "content-type",
-            if uri.starts_with("/v1") { "application/json" } else { "application/soap+xml" },
+            if uri.starts_with("/v1") {
+                "application/json"
+            } else {
+                "application/soap+xml"
+            },
         )
         .body(Body::from(body))
         .unwrap();
@@ -79,10 +83,19 @@ async fn set_rules(w: &Arc<RwLock<World>>, rules: Value) {
 async fn refused(w: &Arc<RwLock<World>>, format: &str, color: &str, dpi: u32, src: &str) -> bool {
     let mut seen = Vec::new();
     for op in ["ValidateScanTicket", "CreateScanJob"] {
-        let (_, b) = send(w, "POST", "/ScannerService", ticket(op, format, color, dpi, src)).await;
+        let (_, b) = send(
+            w,
+            "POST",
+            "/ScannerService",
+            ticket(op, format, color, dpi, src),
+        )
+        .await;
         seen.push(b.contains("Fault"));
     }
-    assert_eq!(seen[0], seen[1], "Validate/Create disagree for {format} {color} {dpi} {src}");
+    assert_eq!(
+        seen[0], seen[1],
+        "Validate/Create disagree for {format} {color} {dpi} {src}"
+    );
     seen[0]
 }
 
@@ -99,10 +112,19 @@ async fn refuses_tiff_bw1_but_not_jfif_rgb() {
             &w,
             "POST",
             "/ScannerService",
-            ticket(op, "tiff-single-uncompressed", "BlackAndWhite1", 100, "Platen"),
+            ticket(
+                op,
+                "tiff-single-uncompressed",
+                "BlackAndWhite1",
+                100,
+                "Platen",
+            ),
         )
         .await;
-        assert!(b.contains("Fault") && b.contains("FormatNotSupported"), "{op}: {b}");
+        assert!(
+            b.contains("Fault") && b.contains("FormatNotSupported"),
+            "{op}: {b}"
+        );
     }
     assert!(!refused(&w, "jfif", "RGB24", 100, "Platen").await);
     assert!(!refused(&w, "tiff-single-uncompressed", "RGB24", 100, "Platen").await);
@@ -116,8 +138,14 @@ async fn refuses_tiff_bw1_but_not_jfif_rgb() {
         .iter()
         .map(|t| t["outcome"].as_str().unwrap())
         .collect();
-    assert_eq!(outcomes[0], "fault:wscn:ClientErrorFormatNotSupported", "{t}");
-    assert_eq!(outcomes[1], "refused:wscn:ClientErrorFormatNotSupported", "{t}");
+    assert_eq!(
+        outcomes[0], "fault:wscn:ClientErrorFormatNotSupported",
+        "{t}"
+    );
+    assert_eq!(
+        outcomes[1], "refused:wscn:ClientErrorFormatNotSupported",
+        "{t}"
+    );
 }
 
 #[tokio::test]
@@ -159,7 +187,16 @@ async fn two_rules_and_clearing() {
     )
     .await;
     assert!(refused(&w, "jfif", "RGB24", 100, "Platen").await);
-    assert!(refused(&w, "tiff-single-uncompressed", "BlackAndWhite1", 100, "Platen").await);
+    assert!(
+        refused(
+            &w,
+            "tiff-single-uncompressed",
+            "BlackAndWhite1",
+            100,
+            "Platen"
+        )
+        .await
+    );
     assert!(!refused(&w, "tiff-single-uncompressed", "RGB24", 100, "Platen").await);
 
     // status shows the rules
@@ -202,7 +239,10 @@ async fn invalid_rules_are_400_with_message() {
         (r#"{"refuse_tickets":[{"colour":"RGB24"}]}"#, "colour"),
         (r#"{"refuse_tickets":[{"color":"Purple"}]}"#, "Purple"),
         (r#"{"refuse_tickets":[{"fault":"Bogus"}]}"#, "Bogus"),
-        (r#"{"refuse_tickets":[{"resolution":"x"}]}"#, "refuse_tickets"),
+        (
+            r#"{"refuse_tickets":[{"resolution":"x"}]}"#,
+            "refuse_tickets",
+        ),
         (r#"{"refuse_tickets":[{"input_source":"Tray"}]}"#, "Tray"),
         (r#"{"refuse_tickets":[{"#, ""),
     ] {
@@ -219,13 +259,35 @@ async fn interplay_with_jfif_bw_reject() {
     let w = world();
     let (st, _) = effects(&w, r#"{"jfif_bw":"reject"}"#).await;
     assert_eq!(st, StatusCode::OK);
-    set_rules(&w, json!([{"format":"tiff-single-uncompressed","color":"BlackAndWhite1"}])).await;
+    set_rules(
+        &w,
+        json!([{"format":"tiff-single-uncompressed","color":"BlackAndWhite1"}]),
+    )
+    .await;
     // either may fault
     assert!(refused(&w, "jfif", "BlackAndWhite1", 100, "Platen").await);
-    assert!(refused(&w, "tiff-single-uncompressed", "BlackAndWhite1", 100, "Platen").await);
+    assert!(
+        refused(
+            &w,
+            "tiff-single-uncompressed",
+            "BlackAndWhite1",
+            100,
+            "Platen"
+        )
+        .await
+    );
     assert!(!refused(&w, "jfif", "RGB24", 100, "Platen").await);
     // clearing the rules leaves jfif_bw=reject in force
     set_rules(&w, json!([])).await;
     assert!(refused(&w, "jfif", "BlackAndWhite1", 100, "Platen").await);
-    assert!(!refused(&w, "tiff-single-uncompressed", "BlackAndWhite1", 100, "Platen").await);
+    assert!(
+        !refused(
+            &w,
+            "tiff-single-uncompressed",
+            "BlackAndWhite1",
+            100,
+            "Platen"
+        )
+        .await
+    );
 }

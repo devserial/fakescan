@@ -562,10 +562,7 @@ impl Srv {
 
 fn dechunk(mut b: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    loop {
-        let Some(i) = b.windows(2).position(|w| w == b"\r\n") else {
-            break;
-        };
+    while let Some(i) = b.windows(2).position(|w| w == b"\r\n") {
         let n = usize::from_str_radix(String::from_utf8_lossy(&b[..i]).trim(), 16).unwrap_or(0);
         if n == 0 {
             break;

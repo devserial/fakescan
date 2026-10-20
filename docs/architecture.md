@@ -58,7 +58,7 @@
 | `GET`/`POST`/`DELETE` | `/v1/loopback` | hard page store (upload JFIF → exact RetrieveImage echo) |
 | `POST` | `/v1/reset` | clear jobs, effects, pattern, loopback, feeder defaults |
 
-Default listen is localhost; use `--listen 0.0.0.0:3920` for LAN.
+Default listen is `0.0.0.0:3920` so a LAN client can open the scan service. The control API is on that same port and has no authentication token. Scan knobs (`/v1/pages`, profile, fault, pattern, …) are reachable from any peer on purpose. Commands that stop the process, write `devices.json`, or change the device set and install state (`shutdown`, `save`, `installed`, `mark_added`, `forget`, `reconcile`, `POST`/`DELETE /v1/devices`, `GET /v1/registry`) are accepted from a loopback peer only, the same rule as `/ui` and `open_settings`. The Windows named pipe is local and does not do that HTTP peer check. Profile ids are a single `[A-Za-z0-9_-]` file name under the profiles directory.
 
 **Lab harness** (optional Python client, not a Cargo dep): [lab-harness.md](lab-harness.md) / `python/`. Print companion on `:3921`: [siblings.md](siblings.md).
 

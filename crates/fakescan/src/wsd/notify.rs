@@ -1,5 +1,6 @@
 //! ScanAvailableEvent delivery to a WS-Eventing NotifyTo sink.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use super::soap;
@@ -34,14 +35,19 @@ pub fn scan_available_event_xml(
 }
 
 /// POST ScanAvailableEvent to `notify_to`. Best-effort: logs and returns Err on failure.
+///
+/// `subscriber` is the TCP peer that registered the sink. Delivery is refused unless the URL's
+/// host is that address (a scanner must not become an open HTTP client).
 pub async fn deliver_scan_available(
     notify_to: &str,
+    subscriber: Option<IpAddr>,
     scan_ns: &str,
     scan_identifier: &str,
     client_context: &str,
 ) -> Result<(), String> {
-    let xml = scan_available_event_xml(scan_ns, notify_to, scan_identifier, client_context);
-    match post_soap_event(notify_to, "ScanAvailableEvent", &xml).await {
+    let target = accept_notify_target(notify_to, subscriber)?;
+    let xml = scan_available_event_xml(scan_ns, &target.url(), scan_identifier, client_context);
+    match post_soap_event(&target, "ScanAvailableEvent", &xml).await {
         Ok(()) => Ok(()),
         Err(e) => {
             warn!(
@@ -56,11 +62,19 @@ pub async fn deliver_scan_available(
 }
 
 /// Generic NotifyTo SOAP POST (ScanAvailableEvent, JobStatusEvent, JobEndStateEvent, …).
-pub async fn post_soap_event(url: &str, _action: &str, body: &str) -> Result<(), String> {
-    let (host, port, path) = parse_http_url(url)?;
+///
+/// The request line is built from [`NotifyTarget`] fields, never from the raw URL, so a
+/// `NotifyTo` value cannot inject headers.
+pub async fn post_soap_event(
+    target: &NotifyTarget,
+    _action: &str,
+    body: &str,
+) -> Result<(), String> {
+    let path = &target.path;
+    let host_header = target.host_header();
     let req = format!(
         "POST {path} HTTP/1.1\r\n\
-         Host: {host}:{port}\r\n\
+         Host: {host_header}\r\n\
          Content-Type: application/soap+xml; charset=utf-8\r\n\
          Content-Length: {len}\r\n\
          Connection: close\r\n\
@@ -68,11 +82,11 @@ pub async fn post_soap_event(url: &str, _action: &str, body: &str) -> Result<(),
          {body}",
         len = body.len(),
     );
-    let connect = TcpStream::connect((host.as_str(), port));
+    let connect = TcpStream::connect((target.host, target.port));
     let mut stream = timeout(NOTIFY_TIMEOUT, connect)
         .await
-        .map_err(|_| format!("connect timeout to {host}:{port}"))?
-        .map_err(|e| format!("connect {host}:{port}: {e}"))?;
+        .map_err(|_| format!("connect timeout to {host_header}"))?
+        .map_err(|e| format!("connect {host_header}: {e}"))?;
     timeout(NOTIFY_TIMEOUT, stream.write_all(req.as_bytes()))
         .await
         .map_err(|_| "write timeout".to_string())?
@@ -105,11 +119,87 @@ fn http_status_code(status_line: &str) -> Option<u16> {
     parts.next()?.parse().ok()
 }
 
-fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
+/// A NotifyTo target that is safe to connect to: an IP literal, no userinfo, no controls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifyTarget {
+    pub host: IpAddr,
+    pub port: u16,
+    pub path: String,
+}
+
+impl NotifyTarget {
+    /// URL rebuilt from the parsed parts (the form stored and placed in `wsa:To`).
+    pub fn url(&self) -> String {
+        match self.host {
+            IpAddr::V4(v4) => format!("http://{v4}:{}{}", self.port, self.path),
+            IpAddr::V6(v6) => format!("http://[{v6}]:{}{}", self.port, self.path),
+        }
+    }
+
+    fn host_header(&self) -> String {
+        match self.host {
+            IpAddr::V4(v4) => format!("{v4}:{}", self.port),
+            IpAddr::V6(v6) => format!("[{v6}]:{}", self.port),
+        }
+    }
+}
+
+/// Accept `url` as a NotifyTo sink for `subscriber`.
+///
+/// WS-Eventing asks the device to POST events to whatever Address the client supplies. On a
+/// scanner bound to every interface that is an open proxy: a Subscribe could name another host,
+/// a link-local metadata address, or a URL with CR/LF that rewrites the request. Delivery is
+/// limited to the TCP peer that subscribed (IPv4-mapped forms compare equal). Subscribe itself
+/// still succeeds when this returns `Err` — eventing is on the WIA "device online" path — but
+/// nothing is stored and nothing is posted.
+pub fn accept_notify_target(url: &str, subscriber: Option<IpAddr>) -> Result<NotifyTarget, String> {
+    let target = parse_http_url(url)?;
+    if is_metadata_host(target.host) || target.host.is_unspecified() || target.host.is_multicast() {
+        return Err(format!("NotifyTo host {} is not allowed", target.host));
+    }
+    let Some(peer) = subscriber else {
+        return Err("NotifyTo has no subscriber address to match".into());
+    };
+    if !same_host(target.host, peer) {
+        return Err(format!(
+            "NotifyTo host {} is not the subscriber {peer}",
+            target.host
+        ));
+    }
+    Ok(target)
+}
+
+fn same_host(a: IpAddr, b: IpAddr) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a, b) {
+        (IpAddr::V4(v4), IpAddr::V6(v6)) | (IpAddr::V6(v6), IpAddr::V4(v4)) => {
+            v6.to_ipv4_mapped() == Some(v4)
+        }
+        _ => false,
+    }
+}
+
+fn is_metadata_host(host: IpAddr) -> bool {
+    // Cloud instance metadata (IPv4 and the IPv6 form). A lab scanner should not call these.
+    match host {
+        IpAddr::V4(v4) => v4.octets() == [169, 254, 169, 254],
+        IpAddr::V6(v6) => v6.segments() == [0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254],
+    }
+}
+
+fn parse_http_url(url: &str) -> Result<NotifyTarget, String> {
     let url = url.trim();
+    if url.chars().any(|c| c.is_control() || c == ' ' || c == '\\') {
+        return Err("NotifyTo contains a control character or space".into());
+    }
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| format!("NotifyTo must be http:// (got {url})"))?;
+    if rest.contains('@') {
+        return Err("NotifyTo must not carry userinfo".into());
+    }
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -117,17 +207,69 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
     if authority.is_empty() {
         return Err("NotifyTo host missing".into());
     }
-    let (host, port) = if let Some(i) = authority.rfind(':') {
-        let host = &authority[..i];
-        let port: u16 = authority[i + 1..]
+    let (host, port) = split_authority(authority)?;
+    if port == 0 {
+        return Err("NotifyTo port 0 is not allowed".into());
+    }
+    let path = path.split('#').next().unwrap_or("/");
+    if path.is_empty() || !path.starts_with('/') || !path_is_safe(path) {
+        return Err("NotifyTo path is not allowed".into());
+    }
+    let host: IpAddr = host
+        .parse()
+        .map_err(|_| format!("NotifyTo host must be an IP address (got {host})"))?;
+    Ok(NotifyTarget {
+        host,
+        port,
+        path: path.to_string(),
+    })
+}
+
+fn split_authority(authority: &str) -> Result<(&str, u16), String> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| format!("bad NotifyTo IPv6 host in {authority}"))?;
+        let host = &rest[..end];
+        if host.is_empty() || host.contains('%') {
+            return Err(format!("bad NotifyTo IPv6 host in {authority}"));
+        }
+        let after = &rest[end + 1..];
+        let port = if after.is_empty() {
+            80
+        } else {
+            let digits = after
+                .strip_prefix(':')
+                .ok_or_else(|| format!("bad NotifyTo port in {authority}"))?;
+            digits
+                .parse()
+                .map_err(|_| format!("bad NotifyTo port in {authority}"))?
+        };
+        return Ok((host, port));
+    }
+    if authority.contains(':') {
+        let (host, digits) = authority
+            .rsplit_once(':')
+            .ok_or_else(|| format!("bad NotifyTo port in {authority}"))?;
+        if host.is_empty() {
+            return Err("NotifyTo host missing".into());
+        }
+        let port = digits
             .parse()
             .map_err(|_| format!("bad NotifyTo port in {authority}"))?;
-        (host.to_string(), port)
-    } else {
-        (authority.to_string(), 80)
-    };
-    let path = if path.is_empty() { "/" } else { path };
-    Ok((host, port, path.to_string()))
+        return Ok((host, port));
+    }
+    Ok((authority, 80))
+}
+
+fn path_is_safe(path: &str) -> bool {
+    path.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '/' | '-' | '.' | '_' | '~' | '%' | '?' | '&' | '=' | '+' | ':' | '@'
+            )
+    })
 }
 
 #[cfg(test)]
@@ -182,15 +324,36 @@ mod tests {
 
     #[test]
     fn parse_http_url_splits_host_port_path() {
-        assert_eq!(
-            parse_http_url("http://127.0.0.1:9999/evt").unwrap(),
-            ("127.0.0.1".into(), 9999, "/evt".into())
-        );
-        assert_eq!(
-            parse_http_url("http://example.com/a").unwrap(),
-            ("example.com".into(), 80, "/a".into())
-        );
+        let v4 = parse_http_url("http://127.0.0.1:9999/evt").unwrap();
+        assert_eq!(v4.host, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(v4.port, 9999);
+        assert_eq!(v4.path, "/evt");
+        let v6 = parse_http_url("http://[::1]:5357/sink").unwrap();
+        assert_eq!(v6.host, "::1".parse::<IpAddr>().unwrap());
+        assert_eq!(v6.port, 5357);
+        assert_eq!(v6.path, "/sink");
+        assert!(parse_http_url("http://example.com/a")
+            .unwrap_err()
+            .contains("IP address"));
         assert!(parse_http_url("https://x/y").is_err());
+        assert!(parse_http_url("http://127.0.0.1:9/x\r\nHost: evil").is_err());
+        assert!(parse_http_url("http://user:pass@127.0.0.1/x").is_err());
+    }
+
+    #[test]
+    fn notify_target_must_be_the_subscriber() {
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let lan: IpAddr = "192.168.1.20".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.168.1.20".parse().unwrap();
+        assert!(accept_notify_target("http://192.168.1.20:5357/sink", Some(lan)).is_ok());
+        assert!(
+            accept_notify_target("http://192.168.1.20:5357/sink", Some(mapped)).is_ok(),
+            "IPv4-mapped subscriber matches the IPv4 NotifyTo"
+        );
+        let denied = accept_notify_target("http://127.0.0.1:9/sink", Some(lan)).unwrap_err();
+        assert!(denied.contains("not the subscriber"), "{denied}");
+        assert!(accept_notify_target("http://169.254.169.254/latest", Some(lo)).is_err());
+        assert!(accept_notify_target("http://127.0.0.1:9/sink", None).is_err());
     }
 
     #[tokio::test]
@@ -213,9 +376,15 @@ mod tests {
         });
 
         let url = format!("http://{addr}/sink");
-        deliver_scan_available(&url, SCAN_NS_AIRSCAN, "uuid:push-1", "ctx-a")
-            .await
-            .expect("deliver");
+        deliver_scan_available(
+            &url,
+            Some(addr.ip()),
+            SCAN_NS_AIRSCAN,
+            "uuid:push-1",
+            "ctx-a",
+        )
+        .await
+        .expect("deliver");
 
         let req = got.lock().await.clone().expect("request captured");
         assert!(req.starts_with("POST /sink HTTP/1.1"), "method/path: {req}");

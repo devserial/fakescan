@@ -1,7 +1,9 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use fakescan::profile::Profile;
 use fakescan::state::World;
@@ -26,12 +28,20 @@ fn app(world: Arc<RwLock<World>>) -> axum::Router {
 }
 
 async fn post_soap(app: axum::Router, xml: &str) -> (StatusCode, String) {
-    let req = Request::builder()
+    post_soap_from(app, xml, "127.0.0.1:40000").await
+}
+
+/// SOAP oneshot from `peer`. A real client always has a TCP address; NotifyTo is stored only when
+/// that address matches the sink host.
+async fn post_soap_from(app: axum::Router, xml: &str, peer: &str) -> (StatusCode, String) {
+    let mut req = Request::builder()
         .method("POST")
         .uri("/ScannerService")
         .header("content-type", "application/soap+xml")
         .body(Body::from(xml.to_string()))
         .unwrap();
+    let addr: SocketAddr = peer.parse().expect("peer");
+    req.extensions_mut().insert(ConnectInfo(addr));
     let res = app.oneshot(req).await.unwrap();
     let status = res.status();
     let bytes = axum::body::to_bytes(res.into_body(), 16 * 1024 * 1024)
@@ -54,12 +64,14 @@ async fn post_soap_body_result(
     app: axum::Router,
     xml: &str,
 ) -> Result<(StatusCode, Vec<u8>), axum::Error> {
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method("POST")
         .uri("/ScannerService")
         .header("content-type", "application/soap+xml")
         .body(Body::from(xml.to_string()))
         .unwrap();
+    let addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(addr));
     let res = app.oneshot(req).await.unwrap();
     let status = res.status();
     let bytes = axum::body::to_bytes(res.into_body(), 16 * 1024 * 1024).await?;
@@ -1556,6 +1568,45 @@ async fn resubscribe_replaces_single_subscription() {
     let (st, body) = post_soap(app(w), &renew).await;
     assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert!(body.contains("InvalidMessage"), "{body}");
+}
+
+#[tokio::test]
+async fn subscribe_from_another_host_does_not_store_notify_to() {
+    let w = world();
+    {
+        let mut g = w.write().await;
+        g.set_identity(
+            "http://127.0.0.1:3920/WebServices/Device".into(),
+            "http://127.0.0.1:3920/ScannerService".into(),
+            uuid::Uuid::nil(),
+        );
+    }
+    let sub = r#"<?xml version="1.0"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+  xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+  xmlns:wse="http://schemas.xmlsoap.org/ws/2004/08/eventing">
+  <soap:Header>
+    <wsa:Action>http://schemas.xmlsoap.org/ws/2004/08/eventing/Subscribe</wsa:Action>
+    <wsa:MessageID>uuid:foreign-sub-0000-0000-000000000001</wsa:MessageID>
+  </soap:Header>
+  <soap:Body>
+    <wse:Subscribe>
+      <wse:Delivery>
+        <wse:NotifyTo>
+          <wsa:Address>http://127.0.0.1:9/sink</wsa:Address>
+        </wse:NotifyTo>
+      </wse:Delivery>
+      <wse:Expires>PT1H</wse:Expires>
+    </wse:Subscribe>
+  </soap:Body>
+</soap:Envelope>"#;
+    // Subscribe still succeeds (a fault looks like the device is offline), but the sink is not
+    // kept: the TCP peer is not the NotifyTo host.
+    let (st, body) = post_soap_from(app(w.clone()), sub, "192.168.1.20:40000").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(body.contains("eventing/SubscribeResponse"), "{body}");
+    assert!(w.read().await.notify_to().is_none());
+    assert!(w.read().await.subscription_id().is_some());
 }
 
 #[tokio::test]

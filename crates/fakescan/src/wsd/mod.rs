@@ -24,7 +24,6 @@ use uuid::Uuid;
 
 use crate::state::World;
 use crate::wsd::responses::jfif_wire_color;
-use crate::wsd::soap::SCAN_NS;
 use crate::wsd::xml::Element;
 
 /// See `elements::published_capability_xml`.
@@ -154,7 +153,7 @@ pub async fn scanner_service(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, "application/soap+xml; charset=utf-8")],
-                soap::fault_with_code(subcode.as_deref(), &reason, relates.as_deref()),
+                soap::fault_with_code(subcode.as_deref(), &reason, relates),
             )
                 .into_response()
         }
@@ -181,6 +180,7 @@ enum SoapOut {
 
 /// All XSD-authorized fault subcodes + common real-driver extensions that
 /// drivers like Brother and Canon emit during actual scanning.
+#[allow(dead_code)] // reference list of the fault subcodes; not consulted by the server yet
 const ALL_FAULT_SUBCODES: &[&str] = &[
     "wscn:InvalidArgs",
     "wscn:OperationFailed",
@@ -774,7 +774,22 @@ async fn dispatch(
             let contexts = req.destination_contexts();
             let notify_url = req.notify_to();
             let filter_dialect = req.filter_dialect();
-            w.set_notify_to(notify_url.as_deref());
+            let subscriber = peer.parse::<SocketAddr>().ok().map(|a| a.ip());
+            // A bad NotifyTo must not fail Subscribe: WIA treats a Subscribe fault as offline.
+            // It is also not stored, so the process will not POST to an arbitrary host.
+            match notify_url.as_deref() {
+                Some(url) => match notify::accept_notify_target(url, subscriber) {
+                    Ok(target) => {
+                        w.set_notify_to(Some(&target.url()));
+                        w.set_notify_subscriber(subscriber);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "NotifyTo rejected; subscription kept without a sink");
+                        w.set_notify_to(None);
+                    }
+                },
+                None => w.set_notify_to(None),
+            }
             w.set_subscription_id(Some(&identifier));
             w.set_subscription_expires(Some(&expires));
             w.set_subscription_deadline(soap::expires_deadline_now(&expires));

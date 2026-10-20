@@ -101,7 +101,7 @@ Do **not** report `ScannerStateReason=AttentionRequired` merely because the ADF 
 |----|--------|
 | Subscribe / Renew / Unsubscribe / GetStatus | **done** — Accept; Identifier + Expires (`PT…` / `P1D` / `P1DT…` / UTC `Z`/`+00:00`); Renew/GetStatus/Unsubscribe check Identifier when present (absent = lab-accept); expired → clear + fault; Filter/@Dialect logged; SubscriptionManager EPR = ScannerService Address + Identifier; single active sub (re-Subscribe replaces) |
 | DestinationResponses when ScanDestinations present | **implemented** (stub tokens echoing ClientContext) |
-| Notification push to NotifyTo | **done** — JobStatus, JobEnd, condition, status summary, elements change, and ScanAvailableEvent POST when Subscribe stored a NotifyTo; otherwise a no-op |
+| Notification push to NotifyTo | **done** — JobStatus, JobEnd, condition, status summary, elements change, and ScanAvailableEvent POST when Subscribe stored a NotifyTo; otherwise a no-op. The Address must be `http://` with an IP host equal to the TCP peer that subscribed (IPv4-mapped forms match). Anything else is not stored and not posted; Subscribe still succeeds so WIA does not go offline |
 | ScanAvailableEvent → device-push CreateScanJob | **implemented** — `ctl push_scan` mints the identifier and POSTs; CreateScanJob checks ScanIdentifier + DestinationToken |
 
 Filter dialects: DPWS prefers Action filter; Windows may send scan-specific filters — ignore unknown filters in the stub rather than faulting when possible. `soap::eventing_filter_dialect` extracts `@Dialect` for Subscribe logs (Brother compare); the filter body is not evaluated.

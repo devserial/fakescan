@@ -92,6 +92,44 @@ pub const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(60);
 /// Default delay before `empty_feeder_brother` refuses a feeder job (measured ~10 s on the Brother).
 pub const DEFAULT_EMPTY_FEEDER_DELAY_MS: u64 = 10_000;
 
+/// Longest control-plane sleep (`/v1/slow` `ms`, lamp warmup, empty-feeder delay).
+///
+/// Those sleeps run on a request thread, and `/v1/slow` holds the device lock for the whole
+/// wait. The control API is reachable from every interface the scan service binds, so an
+/// unbounded value would stall the device indefinitely.
+pub const MAX_CONTROL_DELAY_MS: u64 = 120_000;
+
+/// `Err` when a control-plane sleep exceeds [`MAX_CONTROL_DELAY_MS`].
+pub fn reject_overlong_delay(field: &str, ms: u64) -> Result<()> {
+    if ms > MAX_CONTROL_DELAY_MS {
+        bail!("{field}: {ms} ms exceeds {MAX_CONTROL_DELAY_MS}");
+    }
+    Ok(())
+}
+
+fn bounded_ms(ms: u64) -> u64 {
+    ms.min(MAX_CONTROL_DELAY_MS)
+}
+
+/// Delays on a [`FaultBody`] that would block a request thread past [`MAX_CONTROL_DELAY_MS`].
+pub fn check_fault_delays(body: &FaultBody) -> Result<()> {
+    if let Some(ms) = body.ms {
+        reject_overlong_delay("ms", ms)?;
+    }
+    if let Some(ms) = body.lamp_warmup_ms {
+        reject_overlong_delay("lamp_warmup_ms", ms)?;
+    }
+    if let Some(ms) = body.empty_feeder_delay_ms {
+        reject_overlong_delay("empty_feeder_delay_ms", ms)?;
+    }
+    Ok(())
+}
+
+/// `POST /v1/slow` `ms` past [`MAX_CONTROL_DELAY_MS`].
+pub fn check_slow(body: &SlowBody) -> Result<()> {
+    reject_overlong_delay("ms", body.ms)
+}
+
 impl ScanJob {
     /// Face position within the loaded feeder stack (faces consumed by earlier jobs of the
     /// same stack plus this job's delivered pages). Equals `page_index` for the first job on a
@@ -252,6 +290,8 @@ pub struct World {
     last_destination_token: Option<String>,
     /// NotifyTo Address from the last Subscribe (ScanAvailableEvent sink).
     notify_to: Option<String>,
+    /// TCP peer that registered [`Self::notify_to`]. Events are posted only back to that host.
+    notify_peer: Option<std::net::IpAddr>,
     /// Last granted `wse:Expires` from Subscribe / Renew (WS-Eventing GetStatus).
     subscription_expires: Option<String>,
     /// `wse:Identifier` from the last Subscribe (`uuid:…`).
@@ -718,6 +758,7 @@ impl World {
             destinations: HashMap::new(),
             last_destination_token: None,
             notify_to: None,
+            notify_peer: None,
             subscription_expires: None,
             subscription_id: None,
             subscription_deadline: None,
@@ -752,19 +793,35 @@ impl World {
     }
 
     /// Store the Subscribe `NotifyTo` Address for ScanAvailableEvent delivery.
+    ///
+    /// An empty URL clears the sink and the subscriber peer. Callers that accept a URL must
+    /// also call [`Self::set_notify_subscriber`] with the TCP peer the event may be posted to.
     pub fn set_notify_to(&mut self, url: Option<&str>) {
         self.notify_to = url
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
+        if self.notify_to.is_none() {
+            self.notify_peer = None;
+        }
         if let Some(u) = self.notify_to.clone() {
             self.note("wsd", "NotifyTo", "ok", &u);
         }
     }
 
+    /// TCP address of the client that subscribed. Event delivery refuses any other host.
+    pub fn set_notify_subscriber(&mut self, peer: Option<std::net::IpAddr>) {
+        self.notify_peer = peer;
+    }
+
     /// NotifyTo Address from the last Subscribe, if any.
     pub fn notify_to(&self) -> Option<&str> {
         self.notify_to.as_deref()
+    }
+
+    /// Subscriber address stored with [`Self::set_notify_subscriber`].
+    pub fn notify_peer(&self) -> Option<std::net::IpAddr> {
+        self.notify_peer
     }
 
     /// Alias for event emitters (`job_events` / NotifyTo POST).
@@ -827,6 +884,7 @@ impl World {
         self.last_destination_token = None;
         self.pending_push.clear();
         self.notify_to = None;
+        self.notify_peer = None;
         self.subscription_expires = None;
         self.subscription_id = None;
         self.subscription_deadline = None;
@@ -1474,7 +1532,7 @@ impl World {
     }
 
     pub fn set_slow_retrieve_ms(&mut self, ms: u64) {
-        self.slow_retrieve_ms = ms;
+        self.slow_retrieve_ms = bounded_ms(ms);
     }
 
     pub fn retrieve_bps(&self) -> u64 {
@@ -1486,8 +1544,11 @@ impl World {
     }
 
     /// Apply `POST /v1/slow` — pre-delay always; `bps` only when the field is present.
+    ///
+    /// `ms` is stored capped at [`MAX_CONTROL_DELAY_MS`]. The HTTP and ctl handlers reject an
+    /// over-limit value before calling this, so a client sees an error instead of a silent clamp.
     pub fn apply_slow(&mut self, body: &SlowBody) {
-        self.slow_retrieve_ms = body.ms;
+        self.slow_retrieve_ms = bounded_ms(body.ms);
         if let Some(bps) = body.bps {
             self.retrieve_bps = bps;
         }
@@ -1797,7 +1858,7 @@ impl World {
             self.internal_error = internal;
         }
         if let Some(ms) = body.ms {
-            self.slow_retrieve_ms = ms;
+            self.slow_retrieve_ms = bounded_ms(ms);
         }
         if let Some(n) = body.jam_after_n {
             self.jam_after_n = n;
@@ -1824,13 +1885,13 @@ impl World {
             self.abort_retrieve_bytes = n;
         }
         if let Some(ms) = body.lamp_warmup_ms {
-            self.lamp_warmup_ms = ms;
+            self.lamp_warmup_ms = bounded_ms(ms);
         }
         if let Some(on) = body.empty_feeder_brother {
             self.empty_feeder_brother = on;
         }
         if let Some(ms) = body.empty_feeder_delay_ms {
-            self.empty_feeder_delay_ms = ms;
+            self.empty_feeder_delay_ms = bounded_ms(ms);
         }
         self.note(
             "ctl",
@@ -2107,6 +2168,7 @@ impl World {
         self.destinations.clear();
         self.last_destination_token = None;
         self.notify_to = None;
+        self.notify_peer = None;
         self.subscription_expires = None;
         self.subscription_id = None;
         self.subscription_deadline = None;
@@ -2263,6 +2325,7 @@ impl World {
         self.destinations.clear();
         self.last_destination_token = None;
         self.notify_to = None;
+        self.notify_peer = None;
         self.subscription_expires = None;
         self.subscription_id = None;
         self.subscription_deadline = None;
@@ -2832,8 +2895,8 @@ impl World {
         token: &str,
         peer: Option<String>,
     ) -> Result<(ScanJob, Vec<u8>)> {
-        let delay = self.slow_retrieve_ms;
-        let warmup = self.lamp_warmup_ms;
+        let delay = bounded_ms(self.slow_retrieve_ms);
+        let warmup = bounded_ms(self.lamp_warmup_ms);
         // Fault plan: live / timed / between-pages entries fire here; a mid-page entry
         // is returned for the page about to stream.
         let gate = self.plan_gate_retrieve(job_id, token);
@@ -3455,13 +3518,12 @@ pub(crate) fn ticket_parsed(xml: &str) -> serde_json::Map<String, serde_json::Va
 }
 
 fn extract_resolution(xml: &str) -> Option<u32> {
+    // Only `Resolution/Width`. A ticket that omits Resolution still carries `InputMediaSize`
+    // Width in thousandths of an inch (letter is 8500). Reading the first Width in the tree
+    // treats that media size as a dpi and then "substitutes" the nearest profile dpi.
     let tree = ticket_tree(xml)?;
-    if let Some(res) = tree.descendant("Resolution") {
-        if let Some(w) = res.find_text("Width") {
-            return w.parse().ok();
-        }
-    }
-    tree.find_text("Width")?.parse().ok()
+    let res = tree.descendant("Resolution")?;
+    res.find_text("Width")?.trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -3662,6 +3724,30 @@ mod tests {
         assert_eq!(job.format, "pdf-a");
         let (_, bytes) = w.retrieve_image(job.id, &job.token).expect("page");
         assert!(bytes.starts_with(b"%PDF-1.4"));
+    }
+
+    #[test]
+    fn omitted_resolution_is_the_profile_default_not_media_width() {
+        let w = brother_wsd();
+        // Letter is 8500 x 11000 thousandths of an inch. That Width is not a dpi.
+        let body = r#"
+          <wscn:Format>jfif</wscn:Format>
+          <wscn:InputSource>Platen</wscn:InputSource>
+          <wscn:InputSize><wscn:InputMediaSize>
+            <wscn:Width>8500</wscn:Width><wscn:Height>11000</wscn:Height>
+          </wscn:InputMediaSize></wscn:InputSize>
+        "#;
+        let v = w.validate_ticket(body);
+        assert!(v.valid, "{v:?}");
+        assert_eq!(v.dpi, 100, "first profile dpi, not nearest to 8500");
+        let mut w = brother_wsd();
+        let job = w.create_job(body).expect("platen create");
+        assert!(job.dpi_used_default, "omitted Resolution is UsedDefault");
+        assert!(
+            !job.dpi_overridden,
+            "media width must not look like a substitution"
+        );
+        assert_eq!(job.dpi, 100);
     }
 
     #[test]
@@ -5050,9 +5136,11 @@ mod tests {
         let t1 = Instant::now();
         w.retrieve_image(id, &token).expect("second");
         let second_ms = t1.elapsed().as_millis();
-        // Second image skips warm-up (page_index > 0): it must not pay the 400 ms again.
+        // Second image skips warm-up (page_index > 0): it must not pay the 400 ms again. Compare the
+        // two rather than testing an absolute time: a debug-build encode on a loaded CI runner alone
+        // can take several hundred ms, but the first image is always the warm-up slower.
         assert!(
-            second_ms < u128::from(WARMUP_MS) - 50,
+            second_ms + u128::from(WARMUP_MS) / 2 < first_ms,
             "first={first_ms} second={second_ms}"
         );
     }
